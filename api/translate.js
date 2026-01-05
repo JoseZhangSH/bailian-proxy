@@ -6,14 +6,21 @@ const openai = new OpenAI({
 });
 
 export default async function handler(req, res) {
-  // 1. 添加 CORS 响应头，允许 MasterGo 的 null 源访问
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // 1. 获取请求头中的 Origin
+  const origin = req.headers.origin;
 
-  // 2. 处理预检请求 (OPTIONS)
-  // 浏览器在发送 POST 前会先发 OPTIONS，如果不返回 200，请求会被浏览器拦截
-  if (req.method === "OPTIONS") {
+  // 2. 根据官方文档建议，动态设置 CORS
+  // 如果请求来自插件 (null)，我们就返回 Access-Control-Allow-Origin: null
+  // 这样比硬编码 '*' 对浏览器的兼容性更好
+  res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  // 设置预检请求缓存时间（24小时），减少重复的 OPTIONS 请求
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  // 3. 处理预检请求 (OPTIONS)
+  if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
 
@@ -21,7 +28,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Only POST allowed" });
   }
 
-  // 3. 兼容多种 Body 格式（确保 curl 和 fetch 都能正确解析）
+  // 兼容不同的 Body 解析情况
   const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
   const { text, targetLang } = body || {};
 
@@ -33,30 +40,20 @@ export default async function handler(req, res) {
     const completion = await openai.chat.completions.create({
       model: "qwen-plus",
       messages: [
-        {
-          role: "system",
-          content: "You are a professional UI copy translator for digital products."
-        },
-        {
-          role: "user",
-          content: `请将以下 UI 文案翻译为 ${targetLang}，要求自然、简洁、符合产品界面使用习惯，不要解释：\n${text}`
-        }
+        { role: "system", content: "You are a professional UI copy translator." },
+        { role: "user", content: `请将以下 UI 文案翻译为 ${targetLang}：\n${text}` }
       ],
       temperature: 0.3
     });
 
     const translatedResult = completion.choices[0].message.content;
 
-    // 4. 返回 JSON，使用 'text' 作为键，与插件端的逻辑匹配
     res.status(200).json({
       text: translatedResult,
-      result: translatedResult // 保留 result 以便兼容旧逻辑
+      success: true
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({
-      error: "Model call failed",
-      detail: error.message
-    });
+    res.status(500).json({ error: "Model call failed", detail: error.message });
   }
 }
