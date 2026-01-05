@@ -5,33 +5,23 @@ const openai = new OpenAI({
   baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 });
 
-// 统一 CORS 头
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "POST, OPTIONS"
-  );
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type"
-  );
-}
-
 export default async function handler(req, res) {
-  setCors(res);
+  // 1️⃣ 统一处理 CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // 关键：处理预检请求
+  // 2️⃣ 处理浏览器预检请求
   if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
 
+  // 3️⃣ 只允许 POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Only POST allowed" });
   }
 
   const { text, targetLang } = req.body;
-
   if (!text || !targetLang) {
     return res.status(400).json({ error: "Missing text or targetLang" });
   }
@@ -40,14 +30,8 @@ export default async function handler(req, res) {
     const completion = await openai.chat.completions.create({
       model: "qwen-plus",
       messages: [
-        {
-          role: "system",
-          content: "You are a professional UI copy translator."
-        },
-        {
-          role: "user",
-          content: `请将以下 UI 文案翻译为 ${targetLang}，保持简洁自然：\n${text}`
-        }
+        { role: "system", content: "You are a professional UI copy translator." },
+        { role: "user", content: `请将以下文案翻译为 ${targetLang}：\n${text}` }
       ],
       temperature: 0.3
     });
@@ -55,11 +39,8 @@ export default async function handler(req, res) {
     res.status(200).json({
       result: completion.choices[0].message.content
     });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Model call failed",
-      detail: error.message
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Model call failed", detail: err.message });
   }
 }
