@@ -1,7 +1,85 @@
-// api/generate-image.js（Vercel 函数）- 调用 wan2.6-t2i 文生图
+// api/generate-image.js（Vercel 函数）- 先用 qwen-plus 优化提示词，再调用 wan2.6-t2i 文生图
+import OpenAI from "openai";
+import fs from "fs/promises";
+import path from "path";
+
 const DASHSCOPE_BASE = "https://dashscope.aliyuncs.com";
 const POLL_INTERVAL_MS = 5000;
 const MAX_POLL_COUNT = 24; // 最多轮询约 2 分钟
+
+const openai = new OpenAI({
+  apiKey: process.env.DASHSCOPE_API_KEY,
+  baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+});
+
+let optimizationSystemPromptCache = null;
+
+async function getOptimizationSystemPrompt() {
+  if (optimizationSystemPromptCache) return optimizationSystemPromptCache;
+  try {
+    const filePath = path.join(process.cwd(), "AIGCPromptOptimization");
+    const content = await fs.readFile(filePath, "utf-8");
+    optimizationSystemPromptCache = content;
+    return content;
+  } catch (error) {
+    console.error("Failed to load AIGCPromptOptimization file", error);
+    throw new Error("Failed to load optimization prompt config");
+  }
+}
+
+function normalizeSizeFromDimensions(dimensions, fallbackSize) {
+  if (typeof dimensions !== "string") return fallbackSize;
+  const match = dimensions.trim().match(/^(\d+)\s*[xX*]\s*(\d+)$/i);
+  if (!match) return fallbackSize;
+  const width = match[1];
+  const height = match[2];
+  return `${width}*${height}`;
+}
+
+async function optimizePromptWithQwen({ prompt, size, design_style }) {
+  if (!prompt || typeof prompt !== "string") return null;
+
+  const systemPrompt = await getOptimizationSystemPrompt();
+
+  const completion = await openai.chat.completions.create({
+    model: "qwen-plus",
+    messages: [
+      {
+        role: "system",
+        content: systemPrompt,
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          query: prompt,
+          design_style: design_style || null,
+        }),
+      },
+    ],
+    response_format: { type: "json_object" },
+    temperature: 0.3,
+  });
+
+  let content = completion.choices[0]?.message?.content || "";
+  // 处理可能的 Markdown 代码块包裹
+  content = content.replace(/```json\n?|```/g, "").trim();
+
+  try {
+    const parsed = JSON.parse(content);
+    const optimizedPrompt =
+      parsed.prompt || parsed.optimized_prompt || parsed.text || null;
+    const dimensions =
+      parsed.dimensions || parsed.size || parsed.image_size || null;
+
+    return {
+      prompt: optimizedPrompt,
+      dimensions,
+    };
+  } catch (e) {
+    console.error("Failed to parse optimization result", e, content);
+    return null;
+  }
+}
 
 async function createTask(prompt, options) {
   const apiKey = process.env.DASHSCOPE_API_KEY;
@@ -74,15 +152,33 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
   const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-  const { prompt, size, n, prompt_extend, watermark, negative_prompt, seed } = body || {};
+  const { prompt, size, n, prompt_extend, watermark, negative_prompt, seed, design_style } = body || {};
 
   if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
     return res.status(400).json({ error: "Missing or empty prompt" });
   }
 
   try {
-    const taskId = await createTask(prompt, {
-      size,
+    let optimizationResult = null;
+    try {
+      optimizationResult = await optimizePromptWithQwen({
+        prompt,
+        size,
+        design_style,
+      });
+    } catch (optError) {
+      console.error("Prompt optimization failed, fallback to raw prompt", optError);
+    }
+
+    const optimizedPrompt = optimizationResult?.prompt || prompt;
+    const recommendedSize = normalizeSizeFromDimensions(
+      optimizationResult?.dimensions,
+      size
+    );
+    const finalSize = recommendedSize || size;
+
+    const taskId = await createTask(optimizedPrompt, {
+      size: finalSize,
       n,
       prompt_extend,
       watermark,
