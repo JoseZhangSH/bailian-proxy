@@ -174,11 +174,15 @@ export default async function handler(req, res) {
     }
 
     const optimizedPrompt = optimizationResult?.prompt || prompt;
+    // 尺寸优先级：
+    // 1. 前端显式传入的 size（用户选择）
+    // 2. 优化结果中的 dimensions
+    // 3. 交给 seeddream 自己使用默认值（generateImagesWithSeedDream 内部有默认）
     const recommendedSize = normalizeSizeFromDimensions(
       optimizationResult?.dimensions,
-      size
+      null
     );
-    const finalSize = recommendedSize || size;
+    const finalSize = size || recommendedSize || undefined;
 
     const { images, usage, request_id } = await generateImagesWithSeedDream(
       optimizedPrompt,
