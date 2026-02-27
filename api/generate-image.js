@@ -143,6 +143,16 @@ async function getTaskResult(taskId) {
   return data;
 }
 
+async function fetchImageAsBase64(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch image: ${resp.status} ${resp.statusText}`);
+  }
+  const arrayBuffer = await resp.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  return base64;
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -193,12 +203,36 @@ export default async function handler(req, res) {
 
       if (status === "SUCCEEDED") {
         const choices = result.output?.choices || [];
-        const images = choices
+        const imageItems = choices
           .map((c) => c.message?.content)
           .flat()
           .filter((item) => item && item.type === "image" && item.image)
-          .map((item) => ({ url: item.image }));
-        return res.status(200).json({ images, usage: result.usage, request_id: result.request_id });
+          .map((item) => item.image);
+
+        const images = await Promise.all(
+          imageItems.map(async (url) => {
+            try {
+              const base64 = await fetchImageAsBase64(url);
+              return { url, base64 };
+            } catch (e) {
+              console.error("Failed to fetch or encode image", url, e);
+              return null;
+            }
+          })
+        );
+
+        const filteredImages = images.filter(Boolean);
+
+        if (filteredImages.length === 0) {
+          return res.status(500).json({
+            error: "Image generation succeeded but no image could be fetched",
+            request_id: result.request_id,
+          });
+        }
+
+        return res
+          .status(200)
+          .json({ images: filteredImages, usage: result.usage, request_id: result.request_id });
       }
       if (status === "FAILED" || status === "CANCELED") {
         return res.status(500).json({
