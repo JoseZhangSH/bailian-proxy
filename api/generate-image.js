@@ -1,15 +1,17 @@
-// api/generate-image.js（Vercel 函数）- 先用 qwen-plus 优化提示词，再调用 wan2.6-t2i 文生图
+// api/generate-image.js（Vercel 函数）- 先用 qwen-plus 优化提示词，再调用 seeddream 文生图
 import OpenAI from "openai";
 import fs from "fs/promises";
 import path from "path";
 
-const DASHSCOPE_BASE = "https://dashscope.aliyuncs.com";
-const POLL_INTERVAL_MS = 5000;
-const MAX_POLL_COUNT = 24; // 最多轮询约 2 分钟
-
 const openai = new OpenAI({
   apiKey: process.env.DASHSCOPE_API_KEY,
   baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+});
+
+// 火山方舟 seeddream 客户端（OpenAI 协议兼容）
+const arkClient = new OpenAI({
+  apiKey: process.env.ARK_API_KEY,
+  baseURL: "https://ark.cn-beijing.volces.com/api/v3",
 });
 
 let optimizationSystemPromptCache = null;
@@ -81,66 +83,57 @@ async function optimizePromptWithQwen({ prompt, size, design_style }) {
   }
 }
 
-async function createTask(prompt, options) {
-  const apiKey = process.env.DASHSCOPE_API_KEY;
-  if (!apiKey) throw new Error("Missing DASHSCOPE_API_KEY");
+// 使用火山方舟 seeddream 直接同步生成图片
+async function generateImagesWithSeedDream(prompt, options) {
+  if (!process.env.ARK_API_KEY) {
+    throw new Error("Missing ARK_API_KEY for seeddream");
+  }
 
   const {
-    size = "1280*1280",
+    size = "1024x1024",
     n = 1,
-    prompt_extend = true,
-    watermark = false,
-    negative_prompt,
-    seed,
+    // 目前 seeddream OpenAI 协议主要支持 prompt / size / n 等参数，
+    // negative_prompt / seed 如有需要可后续扩展
   } = options || {};
 
-  const body = {
-    model: "wan2.6-t2i",
-    input: {
-      messages: [
-        {
-          role: "user",
-          content: [{ text: prompt }],
-        },
-      ],
-    },
-    parameters: {
-      enable_interleave: true, // 文生图模式（无输入图）；此模式下 n 固定为 1，用 max_images 控制张数
-      prompt_extend,
-      watermark,
-      n: 1,
-      max_images: Math.min(5, Math.max(1, n)),
-      size,
-    },
+  // 兼容旧的 "宽*高" 或 "宽X高" 写法，统一转成 OpenAI 协议常用的 "宽x高"
+  const normalizedSize =
+    typeof size === "string"
+      ? size.replace(/[*X]/gi, "x")
+      : "1024x1024";
+
+  const resp = await arkClient.images.generate({
+    prompt,
+    model: "doubao-seedream-3-0-t2i-250415",
+    response_format: "url",
+    size: normalizedSize,
+    n: Math.min(5, Math.max(1, n || 1)),
+  });
+
+  const images = await Promise.all(
+    (resp.data || []).map(async (item) => {
+      const url = item.url;
+      if (!url) return null;
+      try {
+        const base64 = await fetchImageAsBase64(url);
+        return { url, base64 };
+      } catch (e) {
+        console.error("Failed to fetch or encode image", url, e);
+        return null;
+      }
+    })
+  );
+
+  const filteredImages = images.filter(Boolean);
+  if (filteredImages.length === 0) {
+    throw new Error("seeddream generation succeeded but no image URL returned");
+  }
+
+  return {
+    images: filteredImages,
+    usage: resp.usage,
+    request_id: resp.id || resp.request_id,
   };
-  if (negative_prompt != null && negative_prompt !== "") body.parameters.negative_prompt = negative_prompt;
-  if (seed != null) body.parameters.seed = seed;
-
-  const res = await fetch(`${DASHSCOPE_BASE}/api/v1/services/aigc/image-generation/generation`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "X-DashScope-Async": "enable",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const data = await res.json();
-  if (data.code) throw new Error(data.message || data.code);
-  const taskId = data.output?.task_id;
-  if (!taskId) throw new Error("No task_id in response");
-  return taskId;
-}
-
-async function getTaskResult(taskId) {
-  const apiKey = process.env.DASHSCOPE_API_KEY;
-  const res = await fetch(`${DASHSCOPE_BASE}/api/v1/tasks/${taskId}`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-  const data = await res.json();
-  if (data.code) throw new Error(data.message || data.code);
-  return data;
 }
 
 async function fetchImageAsBase64(url) {
@@ -187,67 +180,22 @@ export default async function handler(req, res) {
     );
     const finalSize = recommendedSize || size;
 
-    const taskId = await createTask(optimizedPrompt, {
-      size: finalSize,
-      n,
-      prompt_extend,
-      watermark,
-      negative_prompt,
-      seed,
-    });
-
-    for (let i = 0; i < MAX_POLL_COUNT; i++) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      const result = await getTaskResult(taskId);
-      const status = result.output?.task_status;
-
-      if (status === "SUCCEEDED") {
-        const choices = result.output?.choices || [];
-        const imageItems = choices
-          .map((c) => c.message?.content)
-          .flat()
-          .filter((item) => item && item.type === "image" && item.image)
-          .map((item) => item.image);
-
-        const images = await Promise.all(
-          imageItems.map(async (url) => {
-            try {
-              const base64 = await fetchImageAsBase64(url);
-              return { url, base64 };
-            } catch (e) {
-              console.error("Failed to fetch or encode image", url, e);
-              return null;
-            }
-          })
-        );
-
-        const filteredImages = images.filter(Boolean);
-
-        if (filteredImages.length === 0) {
-          return res.status(500).json({
-            error: "Image generation succeeded but no image could be fetched",
-            request_id: result.request_id,
-          });
-        }
-
-        return res
-          .status(200)
-          .json({ images: filteredImages, usage: result.usage, request_id: result.request_id });
+    const { images, usage, request_id } = await generateImagesWithSeedDream(
+      optimizedPrompt,
+      {
+        size: finalSize,
+        n,
+        prompt_extend,
+        watermark,
+        negative_prompt,
+        seed,
       }
-      if (status === "FAILED" || status === "CANCELED") {
-        return res.status(500).json({
-          error: "Image generation failed",
-          task_status: status,
-          message: result.message,
-          request_id: result.request_id,
-        });
-      }
-    }
+    );
 
-    return res.status(202).json({
-      message: "Task still in progress",
-      task_id: taskId,
-      poll_url: `${DASHSCOPE_BASE}/api/v1/tasks/${taskId}`,
+    return res.status(200).json({
+      images,
+      usage,
+      request_id,
     });
   } catch (error) {
     console.error(error);
